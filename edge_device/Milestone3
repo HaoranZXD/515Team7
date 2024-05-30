@@ -1,0 +1,168 @@
+import os
+import subprocess
+import json
+from datetime import datetime
+from time import sleep
+from collections import deque
+import board
+import busio
+from azure.storage.blob import BlobServiceClient
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+import adafruit_veml7700
+from adafruit_bme280 import basic as adafruit_bme280
+from PIL import Image
+
+# Azure Blob Storage Setup
+connect_str = 'your_connect_str'
+container_name = 'your_container_name'
+blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+container_client = blob_service_client.get_container_client(container_name)
+
+# Ensure the directory exists where photos and sensor data will be temporarily stored
+photo_dir = 'Cloudphotos'
+os.makedirs(photo_dir, exist_ok=True)
+
+# Setup I2C
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Initialize sensors
+def initialize_sensors():
+    try:
+        ads = ADS.ADS1115(i2c)
+        chan = AnalogIn(ads, ADS.P0)
+        print("ADS1115 initialized successfully.")
+    except Exception as e:
+        print(f"Error initializing ADS1115: {e}")
+        chan = None
+
+    try:
+        veml7700 = adafruit_veml7700.VEML7700(i2c, address=0x10)
+        print("VEML7700 initialized successfully.")
+    except Exception as e:
+        print(f"Error initializing VEML7700: {e}")
+        veml7700 = None
+
+    try:
+        bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
+        print("BME280 initialized successfully at address 0x76.")
+    except Exception as e:
+        print(f"Error initializing BME280 at address 0x76: {e}")
+        bme280 = None
+
+    return ads, chan, veml7700, bme280
+
+ads, chan, veml7700, bme280 = initialize_sensors()
+
+# Initialize a queue for SMA calculation of lux
+window_size = 5  # Window size for the SMA
+lux_queue = deque(maxlen=window_size)
+
+def capture_photo():
+    """Capture photo using libcamera-still configured for Arducam IMX708 and return the file path."""
+    filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    filepath = os.path.join(photo_dir, filename)
+    # Updated command with specific autofocus option
+    cmd = ["libcamera-still", "-t", "5000", "-o", filepath]
+    subprocess.run(cmd, check=True)
+    print(f"Captured {filepath}")
+    return filepath
+
+def process_photo(filepath):
+    """Rotate the captured photo by 180 degrees, crop, and zoom it."""
+    with Image.open(filepath) as img:
+        # Rotate the image by 180 degrees
+        rotated_img = img.rotate(180)
+        
+        # Calculate the cropping box (center crop and zoom)
+        width, height = rotated_img.size
+        left = width / 5
+        top = height / 5
+        right = width*4 / 5
+        bottom = height*4 / 5
+        
+        cropped_img = rotated_img.crop((left, top, right, bottom))
+        
+        # Resize the cropped image to the original size
+        zoomed_img = cropped_img.resize((width, height), Image.LANCZOS)
+        
+        # Save the processed image
+        zoomed_img.save(filepath)
+    print(f"Processed {filepath} (rotated, cropped, and zoomed)")
+
+def read_sensors():
+    """Read sensor values, apply SMA on lux, and return them as a dictionary."""
+    global lux_queue
+
+    # Get current sensor readings
+    try:
+        current_lux = veml7700.lux if veml7700 else 0.0
+        lux_queue.append(current_lux)
+    except Exception as e:
+        print(f"Error reading VEML7700 sensor: {e}")
+        current_lux = 0.0  # Default to 0 in case of error
+
+    # Calculate SMA for lux
+    avg_lux = sum(lux_queue) / len(lux_queue) if lux_queue else current_lux
+
+    try:
+        temperature = bme280.temperature if bme280 else 0.0
+        humidity = bme280.humidity if bme280 else 0.0
+        pressure = bme280.pressure if bme280 else 0.0
+    except Exception as e:
+        print(f"Error reading BME280 sensor: {e}")
+        temperature = 0.0
+        humidity = 0.0
+        pressure = 0.0
+
+    uv_index = chan.voltage * 0.2 if chan else 0.0  # Example conversion, adjust as necessary
+
+    data = {
+        'lux': round(avg_lux, 2),
+        'temperature': round(temperature, 2),
+        'humidity': round(humidity, 2),
+        'pressure': round(pressure, 2),
+        'uv_index': round(uv_index, 2)
+    }
+    print(f"Sensor Data with SMA for Lux: {data}")
+    return data
+
+def upload_to_azure(file_path, data=None, is_json=False):
+    """Upload captured data to Azure Blob Storage."""
+    blob_client = container_client.get_blob_client(blob=os.path.basename(file_path))
+    if is_json:
+        blob_client.upload_blob(json.dumps(data), overwrite=True)
+    else:
+        with open(file_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+    print(f"Uploaded {file_path} to Azure Blob Storage")
+
+def main():
+    try:
+        # Initial warm-up period for the sensor
+        print("Warming up sensors...")
+        sleep(5)
+        
+        while True:
+            # Capture a photo
+            photo_path = capture_photo()
+            # Rotate, crop, and zoom the photo
+            process_photo(photo_path)
+            # Upload the photo
+            upload_to_azure(photo_path)
+            
+            # Read sensors and upload data
+            sensor_data = read_sensors()
+            sensor_filename = f"sensor_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            sensor_filepath = os.path.join(photo_dir, sensor_filename)
+            upload_to_azure(sensor_filepath, sensor_data, is_json=True)
+            
+            # Wait for 5 seconds before taking the next photo
+            sleep(300)
+    except KeyboardInterrupt:
+        print("Program interrupted")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+if __name__ == "__main__":
+    main()
