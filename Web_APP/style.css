@@ -1,0 +1,11 @@
+/* Adjust navbar height for mobile screens */
+@media (max-width: 768px) {
+    .hydrapp-navbar {
+        top: 0px !important;
+        position: fixed !important;
+    }
+
+    .hydrapp-content {
+        margin-top: 50px !important;
+    }
+}
