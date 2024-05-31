@@ -1,0 +1,6 @@
+streamlit
+python-dotenv
+requests
+google-generativeai
+hydralit
+replicate
